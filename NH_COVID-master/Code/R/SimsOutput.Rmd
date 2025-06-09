@@ -1,0 +1,698 @@
+---
+title: "Simulation Outputs"
+output: html_notebook
+---
+
+# Setup
+
+```{r Load libraries and functions}
+# Libraries --------------
+library(dplyr); library(ggplot2); library(ggpubr);library(Pabloverse); library(sf)
+library(rpart); library(randomForest); library(caret)
+ 
+# FUNCTIONS --------------
+# Function to read the sims -------
+ReadSims <- function(d) {
+  f <- list.files(d, full.names = T)
+  D <- lapply(f, function(x) {
+    read.csv(x)
+  }) %>%
+    do.call(rbind, .)
+  return(D)
+}
+# Function to read the directories --------------
+ReadDirs <- function(d){
+  dirs <- list.dirs(d, recursive = F)
+  Ld <- lapply(dirs, ReadSims)
+  names(Ld) <- gsub(d, '', dirs) %>%  gsub('([^A-z])', '', .)
+  return(Ld)
+}
+# Function for summary tables ---------------
+SumTbl <- function(d){
+  d %>% 
+    summarise_at(.vars = c('AtkRate', 'Cumulative_I', 'Cumulative_I_r', 'Cumulative_I_s', 'Cumulative_H', 'D', 'LastInfection'),
+                 .funs = c('mean' =  ~round(wilcox.test(., conf.int = T)$estimate, 2),
+                           'q05' = ~round(wilcox.test(., conf.int = T)$conf.int[1], 2),
+                           'q95' = ~round(wilcox.test(., conf.int = T)$conf.int[2], 2))) %>% 
+    data.frame() %>% 
+  mutate(LastInfection = paste0(LastInfection_mean, ' (', LastInfection_q05, ', ', LastInfection_q95, ')'),
+         AtkRate = paste0(AtkRate_mean, ' (', AtkRate_q05, ', ', AtkRate_q95, ')'),
+         Cumulative_I = paste0(Cumulative_I_mean, ' (', Cumulative_I_q05, ', ', Cumulative_I_q95, ')'),
+         Cumulative_I_r = paste0(Cumulative_I_r_mean, ' (', Cumulative_I_r_q05, ', ', Cumulative_I_r_q95, ')'),
+         Cumulative_I_s = paste0(Cumulative_I_s_mean, ' (', Cumulative_I_s_q05, ', ', Cumulative_I_s_q95, ')'),
+         Cumulative_H = paste0(Cumulative_H_mean, ' (', Cumulative_H_q05, ', ', Cumulative_H_q95, ')'),
+         D = paste0(D_mean, ' (', D_q05, ', ', D_q95, ')')
+         )
+}
+
+Tbl <- function(d, x){
+  d %>% 
+    group_by(seed) %>%
+    slice(n()) %>%
+    group_by({{x}}) %>%
+    SumTbl() %>%
+    select({{x}}, LastInfection:D) 
+}
+# Function to get the plots -------------------
+RFCART <- function(data, f, main = '', seed = 1, palette  ='-RdYlGn'){
+  PL <- list()
+  
+  set.seed(seed)
+  # Split the data train/test
+  ind <- sample(2, nrow(data), replace = TRUE, prob = c(0.7, 0.3))
+  train <- data[ind==1,]
+  test <- data[ind==2,]
+  # Random Forest model fit
+  rf <- randomForest::randomForest(f, data=train, proximity=TRUE) 
+  print(rf)
+  
+  # Variable importance
+  PL[[2]] <- importance(rf) %>%
+    data.frame() %>% 
+    mutate(variable = rownames(.), RelImpt = IncNodePurity/sum(IncNodePurity)) %>%
+    ggplot(aes(x = reorder(variable, RelImpt), y = RelImpt)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = '', y = 'Relative Importance', title = main) +
+    theme_minimal() +
+    theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=16,face="bold"))
+  
+  # tr <- tree::tree(f, data=data)
+  # plot(tr); text(tr)
+  fit <- rpart(f, data=data, method = 'anova')
+  PL[[1]] <- rpart.plot::rpart.plot(fit, type = 4, box.palette = palette, branch.lty = 2)
+  
+  return(PL)
+}
+ICurveP <- function(x){
+  d$EC %>% 
+    mutate(day = floor(cycle/24)) %>%
+    # group_by(seed) %>% 
+    # mutate(L = n()) %>% ungroup() %>% mutate(mL = max(L), dL = mL - L) %>%  group_by(seed) %>% slice(c(1:n(),rep(n(), max(dL)))) %>% 
+    # ungroup() %>% arrange(seed, day) %>% 
+    group_by(day, {{x}}) %>% 
+    summarise(MeanCI = mean(Cumulative_I), MedianCI = median(I)) %>% 
+   ggplot() +
+  geom_line(aes(day, MeanCI, col = factor({{x}})), lwd = 0.5) +
+  Pabloverse::Theme1()
+}
+
+BoxPlot <- function(d, x, y, ColPal = 1:5) {
+  d %>%
+    group_by(seed, {{y}}) %>%
+    filter(cycle == max(cycle)) %>%
+    ggplot() +
+    geom_boxplot(aes({{x}}, fill = {{y}}), alpha = 0.8, col = 'black') +
+    coord_flip() +
+    scale_fill_manual(values = ColPal)
+}
+
+# Function for linear regression estimates ---------------------------
+LmCI <- function(d, f, a = 0.05) {
+  # fit the model
+  m <- d %>%
+    lm(f, data = .)
+  # obtain coefficients and CI
+  coef <- round(m$coefficients, 2) # coefficients
+  ci <- round(confint(m), 2) # CI
+  p <- broom::glance(m)$p.value
+  sig <- ifelse(p < a, '$^*$', '')
+  # Paste it in a string
+  est <- paste0(coef, '(', ci[,1], ',', ci[,2], ')', sig)
+  names(est) <- names(coef)
+  # data.frame(Var = names(coef), est) %>% 
+    return(est)
+}
+```
+
+## Load the simulations
+
+```{r load the data}
+N <- 170 + 174 # Total population
+p <- "../GAMA_NHCOVID/NH_COVID/models/results/GSA/" # Directory for simulations
+d <- ReadDirs(p) # Read all the simulations
+Outcomes <- c('I', 'Cumulative_I', 'I_r', 'I_s', 'Introductions', 'PassiveDet_s', 'ActiveDet_s', 'PassiveDet_r', 'ActiveDet_r') # Outcomes analyzed
+Var <- c('GlobalShedding_p', 'AsymptTransmission', 'Introduction_p', 'TestingFreq', 'detection_p', 'SR_OR', 'PPE_OR',  'vaccination_dist', 'VaccineEff') # Model parameters examined
+
+
+d$EC <- d$EC %>% 
+  mutate(Cumulative_I = Cumulative_I_r + Cumulative_I_s, # Total infected (Staff + residents)
+         AtkRate = Cumulative_I / N, # Attack rate
+         LastInfection = (LastInfection/24) + 0, # Add days of sickness (in average, fix this later in the model)
+         detection_p = Test_sensitivity) %>% 
+  mutate_at(Var, factor) %>% # Convert all model parameters examined to factor
+  mutate(Introduction_p = recode(as.character(Introduction_p), `0.01` = 'Low', `0.05` = 'Medium', `0.1` = 'High')) %>% 
+  data.frame()
+
+# Get the cumulative numbers for each simulation run
+d$Cum <- d$EC %>% 
+  group_by(seed) %>% 
+  slice(n()) %>% 
+  data.frame()
+
+d$ECo <- d$EC %>% 
+  group_by(seed) %>% 
+  mutate(T_I_r = max(Cumulative_I_r)) %>% 
+  data.frame() %>% 
+  filter(T_I_r > 1)
+
+
+# How long did it took to run? (in minutes, must be from continuous runs)
+d$EC %>% 
+  group_by(seed) %>% 
+  summarise(t = (max(t) - min(t))/(1000*60)) %>% 
+  pull(t) %>% 
+  mean()
+# Total simulations
+nrow(d$Cum)
+```
+
+### Corplot 
+
+```{r}
+ds <- d$Cum %>% 
+  select(c(Outcomes, Var)) %>%
+  mutate_all(~as.numeric(as.factor(.)))
+  
+  # count(seed, .dots=lapply(c(Outcomes, Var), as.symbol)) %>% 
+  # select(-seed, -n) %>% 
+  # mutate_all(~as.numeric(as.factor(.)))
+ds %>% 
+  # count(TestingFreq, PPE_OR)
+  # count(TestingFreq, Introduction_p)
+  count(detection_p, PPE_OR)
+  # count(AsymptTransmission, Introduction_p)
+
+corrplot::corrplot(cor(ds))
+```
+
+# Validation
+
+The model was calibrated and validated with data on confirmed COVID-19 cases reported between May 24, 2020, and February 14, 2021, in California nursing homes with similar resident census (between 150 and 200 occupied beds) extracted from the Centers for Medicare & Medicaid Services (CMS)
+
+```{r Prepare the data}
+# Load and filter the CMS data
+CMS_CA <- read.csv("../../Data/CMS/COVID-19_Nursing_Home_Dataset.csv") %>%
+  mutate(date = as.Date(Week.Ending, format = '%m/%d/%Y')) %>% # format the date
+  filter(Provider.State == "CA") # Filter to CA only
+
+# Data from interviewed NH
+CVS <- CMS_CA %>%
+  filter(Provider.Name == 'CLEAR VIEW SANITARIUM') %>%
+  arrange(date) %>%
+  filter(Residents.Total.Confirmed.COVID.19 > 0) %>% # filter only where > 1 infected
+  mutate(I = Residents.Total.Confirmed.COVID.19 + Staff.Total.Confirmed.COVID.19) %>% # Get total infected
+  select(Provider = Federal.Provider.Number, I, date, Ir_cumsum = Residents.Total.Confirmed.COVID.19, IS_cumsum = Staff.Total.Confirmed.COVID.19) %>% 
+  mutate(day = (date - first(date)) + 7)
+```
+
+
+```{r Observed data}
+range(CMS_CA$date) # Range of dates
+
+# Format the data:
+CMSCA_ts <- CMS_CA %>% 
+  replace(is.na(.), 0) %>% # replace NAs with 0
+  # Select only relevant variables
+  select(date, Provider = Federal.Provider.Number, Ir = Residents.Weekly.Confirmed.COVID.19, Is = Staff.Weekly.Confirmed.COVID.19, Dr = Residents.Weekly.COVID.19.Deaths, OccBeds = Total.Number.of.Occupied.Beds) %>%
+  arrange(Provider, date) %>% # Sort by date and provider
+  group_by(Provider) %>% #group by provider
+  mutate_at(.vars = c('Ir', 'Is', 'Dr'), .funs = c('cumsum', 'sum')) %>% # Get cumulative numbers
+  mutate(CumI = Ir_cumsum + Is_cumsum,
+         TotalI = Ir_sum + Is_sum) %>%
+  filter(CumI > 0) %>%
+  mutate(OccBeds = max(OccBeds), 
+         d = date - first(date), 
+         p_infection = Ir_sum/OccBeds, 
+         I = Ir + Is) %>%
+  filter(between(OccBeds, 160, 200),
+         TotalI != CumI)
+
+Obs <- CMSCA_ts %>% data.frame() %>%
+  filter(d < 150) %>%
+  mutate(day = d, type = "observed") %>%
+  select(day, CumI, type, Ir_cumsum, Is_cumsum, Sim = Provider)
+
+
+
+Obs_s <- Obs %>% 
+  group_by(day, type) %>% 
+  summarise_at(.vars = c('CumI', 'Ir_cumsum', 'Is_cumsum'), 
+               .funs = c(m = ~quantile(., 0.5), q05 = ~quantile(., 0.25), q95 = ~quantile(., 0.75)))%>% 
+  mutate(day = as.numeric(day))
+```
+
+## Observed vs sim
+
+```{r}
+B <- d$EC %>% 
+  filter(TestingFreq == 7) %>%
+  filter(Introduction_p == "Medium") %>%
+  filter(vaccination_dist == 0) %>%
+  # filter(detection_p == 0.8) %>%
+  filter(PPE_OR == 0.1467) %>%
+  filter(GlobalShedding_p %in% c(0.38, 0.38*1.2)) %>%
+  # filter(TestingFreq == 7, vaccination_dist == 0, GlobalShedding_p == 0.35) %>%
+  data.frame()
+
+Exp <- B %>%
+  mutate(day = cycle/24, CumI = Cumulative_I_r + Cumulative_I_s, type = "simulated") %>% 
+  # Repeat the last row 150 times
+  group_by(seed) %>%
+  mutate(tMinus = 150 - max(day)) %>%
+  slice(c(1:n(), rep(n(), 150))) %>%
+  mutate(day = 1:n()) %>%  # Change the day number in order
+  slice(1:150) %>% # select the first 150 of each group (seed)
+  select(day,LastInfection,  CumI, type, Ir_cumsum = Cumulative_I_r, Is_cumsum = Cumulative_I_s, Sim = seed, Introductions) %>% 
+  group_by(day, type) 
+
+Exp_s <- Exp %>% 
+  summarise_at(.vars = c('LastInfection', 'CumI', 'Ir_cumsum', 'Is_cumsum', 'Introductions'), 
+               .funs = c(m = ~quantile(., 0.5), q05 = ~quantile(., 0.05), q95 = ~quantile(., 0.95))
+               )
+
+Ob_Ex <- rbind(Obs_s, Exp_s)
+OEp <- list()
+
+B %>%
+  group_by(seed) %>% 
+  slice(n())
+
+B %>% mutate(i = 1) %>% Tbl(., i)
+
+OEp[[1]] <- Ob_Ex %>% 
+  ggplot(aes(x = day)) +
+  geom_ribbon(aes(ymin = Is_cumsum_q05, ymax = Is_cumsum_q95, fill = type, col = type), alpha = 0.15) +
+  geom_line(aes(y = Is_cumsum_m, col = type), lwd = 1, alpha = 0.8) +
+  geom_point(data = CVS, aes(y = IS_cumsum, alpha = ''), shape = 18, size = 2.5, col = 'black') +
+  scale_color_manual(values = c('red3', "blue3")) +
+  scale_fill_manual(values = c('red2', "blue2")) +
+  theme_minimal() +
+  scale_alpha_manual(values = 1) +
+  labs(title = 'Staff', y = 'Median', x = 'Day', alpha = 'LCF Interviewed') +
+  xlim(c(0, 150))
+
+OEp[[2]] <- Ob_Ex %>% 
+  ggplot(aes(x = day)) +
+  geom_ribbon(aes(ymin = Ir_cumsum_q05, ymax = Ir_cumsum_q95, fill = type, col = type), alpha = 0.15) +
+  geom_line(aes(y = Ir_cumsum_m, col = type), lwd = 1, alpha = 0.8) +
+  geom_point(data = CVS, aes(y = Ir_cumsum, alpha = ''), shape = 18, size = 2.5, col = 'black') +
+  scale_color_manual(values = c('red3', "blue3")) +
+  scale_fill_manual(values = c('red2', "blue2")) +
+  theme_minimal() +
+  scale_alpha_manual(values = 1) +
+  labs(title = 'Residents', y = 'Median', x = 'Day', alpha = 'LCF Interviewed') +
+  xlim(c(0, 150))
+
+ggarrange(plotlist = OEp, common.legend = T) %>% 
+  annotate_figure(top = "Observed vs simulated outbreaks") 
+# %>% 
+  # ggsave(filename = '../../Documentation/Figures/V2/ObsExp.png', width = 8, height = 4.5)
+```
+
+### Validation
+
+```{r}
+# Correlation and R^2
+dm <- rbind(Obs, Exp[-c(2, 8)]) %>%
+  group_by(day, type) %>%
+  summarise_at(.vars = c('CumI', 'Ir_cumsum', 'Is_cumsum'), .funs = median) %>%
+  arrange(type) %>%
+  data.frame()
+
+odays <- dm %>%
+  filter(type == 'observed') %>%
+  pull(day)
+
+dms <- dm %>%
+  filter(day %in% odays, 
+         day != 0) %>%
+  split(.$type)
+
+#Correlation
+pIt <- cor(dms$observed$CumI, dms$simulated$CumI)
+pIr <- cor(dms$observed$Ir_cumsum, dms$simulated$Ir_cumsum)
+pIs <- cor(dms$observed$Is_cumsum, dms$simulated$Is_cumsum)
+
+R2t <- lm(dms$observed$CumI~dms$simulated$CumI) %>%
+  summary() %>%
+  .$r.squared
+
+R2r <- lm(dms$observed$Ir_cumsum~dms$simulated$Ir_cumsum) %>%
+  summary() %>%
+  .$r.squared
+
+R2s <- lm(dms$observed$Is_cumsum~dms$simulated$Is_cumsum) %>%
+  summary() %>%
+  .$r.squared
+```
+
+## Overview (univariate)
+
+```{r overall outbreak size}
+d$EC %>% 
+  group_by(seed) %>% 
+  filter(cycle == max(cycle)) %>% 
+  ggplot() +
+  geom_histogram(aes(AtkRate))
+
+nvd <- d$EC %>% filter(vaccination_dist == 0.0, PPE_OR == 0.1467)
+
+BoxPlot(d = d$EC, x = AtkRate, y = GlobalShedding_p)
+Tbl(d = d$EC, x = GlobalShedding_p)
+BoxPlot(d = d$EC, x = AtkRate, y = Introduction_p)
+Tbl(d = d$EC, x = Introduction_p)
+BoxPlot(d = d$EC, x = AtkRate, y = detection_p)
+Tbl(d = d$EC, x = detection_p)
+BoxPlot(d = d$EC, x = AtkRate, y = PPE_OR)
+Tbl(d = d$EC, x = PPE_OR)
+BoxPlot(d = d$EC, x = AtkRate, y = AsymptTransmission)
+Tbl(d = d$EC, x = AsymptTransmission)
+BoxPlot(d = d$EC, x = AtkRate, y = vaccination_dist)
+Tbl(d = d$EC, x = vaccination_dist)
+BoxPlot(d = nvd, x = AtkRate, y = TestingFreq)
+Tbl(d = nvd, x = TestingFreq)
+BoxPlot(d = d$EC, x = AtkRate, y = SR_OR)
+Tbl(d = d$EC, x = SR_OR)
+
+BoxPlot(d = d$EC %>% filter(vaccination_dist != 0), x = AtkRate, y = VaccineEff)
+Tbl(d = d$EC, x = VaccineEff)
+```
+
+### ~Experimental function~
+
+```{r}
+f <- 'LastInfection~GlobalShedding_p'
+
+Outcomes <- c('LastInfection', 'AtkRate', 'Cumulative_I', 'Cumulative_I_r', 'Cumulative_I_s', 'Cumulative_H', 'D')
+
+Vs <- c('GlobalShedding_p', 'Introduction_p', 'detection_p', 'PPE_OR', 'AsymptTransmission', 'SR_OR')
+# , 'vaccination_dist', , )
+Ut <- list()
+Ut[[1]] <- lapply(Vs, function(y){
+  lapply(Outcomes, function(x){
+  LmCI(d = d$Cum %>% 
+         mutate_at(Vs, .funs = ~relevel(factor(.), 2)) %>% 
+         mutate(Introduction_p = relevel(Introduction_p, 'Medium'),
+                TestingFreq = relevel(TestingFreq, '7'),
+                SR_OR = relevel(SR_OR, '1')) %>% 
+         filter(., vaccination_dist == 0), f = paste0(x, '~', y))
+}) %>% 
+  do.call(cbind, .) %>% 
+  data.frame() %>% `names<-`(Outcomes)
+}) %>% 
+  do.call(rbind, .) 
+
+Ut[[2]] <- lapply(Outcomes, function(x){
+  LmCI(d = d$Cum  %>%
+         mutate(TestingFreq = relevel(TestingFreq, '7')) %>%
+         filter(PPE_OR == 0.1467) %>%
+         filter(., vaccination_dist == 0),
+       f = paste0(x, '~', 'TestingFreq'))
+}) %>% 
+  do.call(cbind, .) %>% 
+  data.frame() %>% `names<-`(Outcomes)
+
+# Vaccine distribution
+Ut[[3]] <- lapply(Outcomes, function(x){
+  LmCI(d = d$Cum  %>%
+         mutate(vaccination_dist = relevel(vaccination_dist, '0'))
+       , f = paste0(x, '~', 'vaccination_dist'))
+}) %>% 
+  do.call(cbind, .) %>% 
+  data.frame() %>% `names<-`(Outcomes)
+# Vaccine efficacy
+Ut[[4]] <- lapply(Outcomes, function(x){
+  LmCI(d = d$Cum  %>%
+         filter(vaccination_dist != 0) %>% 
+         mutate(VaccineEff = relevel(VaccineEff, 'Equal'))
+       , f = paste0(x, '~', 'VaccineEff'))
+}) %>% 
+  do.call(cbind, .) %>% 
+  data.frame() %>% `names<-`(Outcomes)
+
+Ut %>% 
+  do.call(rbind, .) %>% 
+  write.csv('../../Documentation/Tables/Univ.csv', quote = F, sep = '&')
+```
+
+```{r}
+d$Cum %>% 
+  filter(GlobalShedding_p == 0.304) %>% 
+  group_by(i = 1) %>% 
+  summarise_at(Outcomes, .funs = ~mean(.))
+```
+
+## Bivar
+
+```{r bivariate boxplot, fig.height=7, fig.width=7}
+BoxPlot.Bi <- function(d, x, y, z, ColPal = c(1, 2, 3)) {
+  d %>%
+    group_by(seed, {{y}}, {{z}}) %>%
+    filter(cycle == max(cycle)) %>%
+    ggplot() +
+    geom_boxplot(aes({{x}}, fill = {{y}}), alpha = 0.6) +
+    facet_wrap(vars({{z}}))+
+    coord_flip() +
+     scale_fill_manual(values = ColPal) +
+    theme_minimal() +
+    theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(colour="black",
+                                        fill="grey90")) +
+    theme(legend.position = 'top')
+}
+dc <- d$EC %>% 
+  # filter(Introduction_p == 0.01) %>%
+  # filter(vaccination_dist == 0) %>%
+  # filter(GlobalShedding_p %in% c(0.25)) %>%
+  # filter(vaccination_dist != 0) %>%
+  group_by(seed) %>% 
+  slice(n())%>% 
+  mutate(Cumulative_I = Cumulative_I_r + Cumulative_I_s, D = D*4)
+
+PSc <- list()
+
+PSc[[1]] <- d$Cum %>% 
+  mutate(Introduction_p = factor(Introduction_p, levels = c('Low', 'Medium', 'High'))) %>%
+  filter(vaccination_dist == 0) %>% 
+  # mutate(TestingFreq = relevel(TestingFreq, ref = '7')) %>% 
+  filter(PPE_OR == c(0.1467)) %>%
+  # filter(PPE_OR %in% c(0.1467),  detection_p %in% c(1.2*0.8)) %>%
+  BoxPlot.Bi(d = ., x = AtkRate, y = TestingFreq, z = Introduction_p, ColPal =  c("#C70704", "#BAB700", "#008C0C"))
+
+PSc[[2]] <- filter(d$EC, PPE_OR == 0.1467) %>%
+  mutate(Introduction_p = factor(Introduction_p, levels = c('Low', 'Medium', 'High'))) %>%
+  filter(vaccination_dist != 0) %>% 
+  mutate(`Vaccination Distribution` = recode(vaccination_dist, `0.3` = 'Resident Priority', `0.5` = 'Equal', `0.7` = 'Staff priority')) %>% 
+  BoxPlot.Bi(d = ., x = AtkRate, y = `Vaccination Distribution`, z = Introduction_p, ColPal <- c("#414042", "#8C8700", "#5D0DB3"))
+
+# PSc[[3]] <- filter(d$EC, PPE_OR == 0.1467) %>%
+#   filter(vaccination_dist != 0) %>% 
+#   mutate(`Vaccine Efficacy` = recode(VaccineEff, `A` = 'Pfizer', `B` = 'Moderna' )) %>% 
+#   BoxPlot.Bi(d = ., x = AtkRate, y = `Vaccine Efficacy`, z = Introduction_p, ColPal <- c("#5C9669", "#6A918C", "#7280B3"))
+
+ggarrange(plotlist = PSc, ncol = 1) %>%
+  ggsave(filename = '../../Documentation/Figures/V2/Scenarios.png', width = 7, height = 7)
+```
+
+
+```{r}
+d$Cum %>% 
+  mutate(Introduction_p = factor(Introduction_p, levels = c('Low', 'Medium', 'High'))) %>%
+  filter(vaccination_dist == 0) %>% 
+  # mutate(TestingFreq = relevel(TestingFreq, ref = '7')) %>% 
+  # filter(PPE_OR == c(0.1467)) %>%
+  # filter(PPE_OR %in% c(0.1467),  detection_p %in% c(1.2*0.8)) %>%
+  BoxPlot.Bi(d = ., x = AtkRate, y = TestingFreq, z = GlobalShedding_p, ColPal =  c("#C70704", "#BAB700", "#008C0C"))
+
+d$Cum %>% 
+  mutate(Introduction_p = factor(Introduction_p, levels = c('Low', 'Medium', 'High'))) %>%
+  filter(vaccination_dist != 0) %>%
+  # mutate(TestingFreq = relevel(TestingFreq, ref = '7')) %>% 
+  # filter(PPE_OR == c(0.1467)) %>%
+  # filter(PPE_OR %in% c(0.1467),  detection_p %in% c(1.2*0.8)) %>%
+  BoxPlot.Bi(d = ., x = AtkRate, y = vaccination_dist, z = GlobalShedding_p, ColPal =  c("#C70704", "#BAB700", "#008C0C"))
+```
+
+
+
+```{r}
+BTbl <- list()
+
+BTbl[[1]] <- lapply(unique(d$Cum$Introduction_p), function(y){
+  lapply(Outcomes, function(x){
+  LmCI(d = d$Cum  %>%
+         mutate(TestingFreq = relevel(TestingFreq, ref = '7')) %>% 
+         filter(vaccination_dist == 0) %>% 
+         filter(PPE_OR == c(0.1467)) %>%
+         filter(Introduction_p == y),
+       f = paste0(x, '~', 'TestingFreq'))
+}) %>% 
+  do.call(cbind, .) %>% 
+  data.frame() %>%
+    `names<-`(Outcomes) %>% 
+  mutate(Var = rownames(.)) %>% 
+    mutate(y = y)
+}) %>% 
+  do.call(rbind,.)
+
+BTbl[[2]] <- lapply(unique(d$Cum$Introduction_p), function(y){
+  lapply(Outcomes, function(x){
+  LmCI(d = d$Cum  %>%
+         filter(vaccination_dist != 0) %>% 
+         mutate(vaccination_dist = relevel(vaccination_dist, ref = '0.5')) %>% 
+         filter(Introduction_p == y),
+       f = paste0(x, '~', 'vaccination_dist'))
+}) %>% 
+  do.call(cbind, .) %>% 
+  data.frame() %>%
+    `names<-`(Outcomes) %>% 
+  mutate(Var = rownames(.)) %>% 
+    mutate(y = y)
+}) %>% 
+  do.call(rbind,.)
+
+BTbl %>% 
+  do.call(rbind, .) %>% 
+  write.csv('../../Documentation/Tables/Biv.csv', quote = F, row.names = F)
+```
+
+
+```{r}
+LmSum <- function(f, d){
+   m <- lm(f, d)
+   coef <- round(m$coefficients, 4)
+   ci <- round(confint(m), 4)
+
+   data.frame(coef, ci) %>% 
+     slice(-1) %>% 
+     mutate(var = row.names(.), Est = paste0(coef, ' (', ci[1,], ',',ci[2,], ')')) %>% 
+     select(var, Est) %>% 
+     return()
+}
+```
+
+```{r}
+# Testing Frequency --------------
+dc %>% 
+  mutate(TestingFreq = relevel(TestingFreq, ref = '7')) %>% 
+  # filter(detection_p %in% c(1.2*0.8))
+  filter(PPE_OR %in% c(0.1467)) %>% 
+  filter(vaccination_dist == 0.0) %>% 
+  filter(Introduction_p == 'Low') %>%
+  LmSum('AtkRate~TestingFreq', d = .)
+
+dc %>% 
+  mutate(TestingFreq = relevel(TestingFreq, ref = '7')) %>% 
+  # filter(detection_p %in% c(1.2*0.8)) %>% 
+  filter(PPE_OR %in% c(0.1467)) %>% 
+  filter(vaccination_dist == 0.0) %>% 
+  filter(Introduction_p == 'Medium') %>%
+  LmSum('AtkRate~TestingFreq', d = .)
+
+dc %>% 
+  mutate(TestingFreq = relevel(TestingFreq, ref = '7')) %>% 
+  # filter(detection_p %in% c(1.2*0.8)) %>% 
+  filter(PPE_OR %in% c(0.1467)) %>% 
+  filter(vaccination_dist == 0.0) %>% 
+  filter(Introduction_p == 'High') %>%
+  # lm(Cumulative_I~TestingFreq, .) %>% 
+  # summary()
+  LmSum('AtkRate~TestingFreq', d = .)
+```
+
+## GSA
+
+```{r}
+dc <- d$Cum %>% 
+  # filter(Introduction_p == 0.01) %>%
+  # filter(vaccination_dist == 0) %>%
+  # filter(GlobalShedding_p %in% c(0.25)) %>%
+  # filter(vaccination_dist != 0) %>%
+ mutate_at(.vars = c('GlobalShedding_p', 'detection_p', 'AsymptTransmission', 'SR_OR'), .funs = ~factor(., labels = c('Low', 'Med', 'High')))%>% 
+  mutate(PPE_OR = factor(PPE_OR, labels = c('High', 'Med', 'Low'))) %>% 
+  mutate(vaccination_dist = recode(vaccination_dist, `0` = 'No vaccinaiton', `0.3` = 'Resident', `0.5` = 'Equal', `0.7` = 'Staff')) %>% 
+  mutate(Cumulative_I = Cumulative_I_r + Cumulative_I_s)
+
+####### Function to get the plots ##########
+RFCART <- function(data, f, main = '', seed = 1, palette  ='-RdYlGn'){
+  PL <- list()
+  
+  set.seed(seed)
+  # Split the data train/test
+  ind <- sample(2, nrow(data), replace = TRUE, prob = c(0.7, 0.3))
+  train <- data[ind==1,]
+  test <- data[ind==2,]
+  # Random Forest model fit
+  rf <- randomForest::randomForest(f, data=train, proximity=TRUE) 
+  print(rf)
+  
+  # Variable importance
+  PL[[2]] <- importance(rf) %>%
+    data.frame() %>% 
+    mutate(variable = rownames(.), RelImpt = IncNodePurity/sum(IncNodePurity)) %>%
+    ggplot(aes(x = reorder(variable, RelImpt), y = RelImpt)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = 'Parameters', y = 'Relative Importance', title = main) +
+    theme_minimal()
+  
+  # tr <- tree::tree(f, data=data)
+  # plot(tr); text(tr)
+  fit <- rpart(f, data=data, method = 'anova')
+  PL[[1]] <- rpart.plot::rpart.plot(fit, type = 4, box.palette = palette, branch.lty = 2)
+  
+  return(PL)
+}
+
+dc <- dc %>% 
+  mutate(Infection_p = GlobalShedding_p, `Asymptomatic transmission` = AsymptTransmission)
+
+# Cummulative Infected
+f1 <- Cumulative_I ~ Infection_p + AsymptTransmission + Introduction_p + TestingFreq + detection_p + PPE_OR + vaccination_dist + VaccineEff
+
+RFCART(data = dc, f = f1)
+
+# Cummulative Hosp
+f2 <- Cumulative_H ~ Infection_p + AsymptTransmission + Introduction_p + TestingFreq + detection_p + PPE_OR + vaccination_dist + VaccineEff
+
+RFCART(data = dc, f = f2)
+
+# Cummulative Deaths
+f3 <- D ~ Infection_p + AsymptTransmission + Introduction_p + TestingFreq + detection_p + PPE_OR + vaccination_dist + VaccineEff
+RFCART(data = dc, f = f3)
+```
+
+
+
+```{r}
+## Export the results
+png(filename = '../../Documentation/Figures/V2/CumRTI.png', width = 6.5, height = 5,res = 300, units = 'in')
+Ps <- RFCART(f = f1 ,data = dc, 
+             main = '')
+dev.off()
+Ps[[2]]  %>%
+  ggsave(filename = '../../Documentation/Figures/V2/CumI-VI.png', plot = ., width = 6.5, height = 2)
+
+## Export the results
+png(filename = '../../Documentation/Figures/V2/DRT.png', width = 6.5, height = 5,res = 300, units = 'in')
+Ps <- RFCART(f = f3 ,data = dc, 
+             main = '')
+dev.off()
+Ps[[2]]  %>%
+  ggsave(filename = '../../Documentation/Figures/V2/D-VI.png', plot = ., width = 6.5, height = 2)
+```
+
+
+```{r CART Interactive version}
+library(visNetwork)
+r <- rpart(formula = f1, data = dc)
+
+visTree(r, 
+        colorEdges = '#6E0E0CC9', # color of the edges
+        shapeY = 'diamond', # shpe of the outcome
+        colorY = c("#F2D600", "#EB0400")) # color gradient c(min, max)
+```
+

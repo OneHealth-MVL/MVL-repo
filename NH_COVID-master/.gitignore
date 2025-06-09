@@ -1,0 +1,25 @@
+# if having problems with files that should be ignored but already in the repo use:
+# git rm -r --cached .
+# git add .
+
+# Global 
+misc
+
+# R stuff
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Documentation
+Documentation/
+
+## GAMA stuff
+results
+.metadata
+.project
+.gama.epf
+.gama_application_workspace
+.built_in_models_1597176163533
+.built_in_models_1656609883982
+NH_COVIDv2
